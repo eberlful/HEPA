@@ -135,31 +135,64 @@ class HEPAEncoder(nn.Module):
         self.norm = nn.LayerNorm(model_dim)
         self.pool_query = nn.Parameter(torch.randn(model_dim) * 0.02)
 
-    def _instance_norm(self, x: Tensor) -> Tensor:
-        mean = x.mean(dim=1, keepdim=True)
-        std = x.std(dim=1, keepdim=True).clamp_min(1e-5)
-        return (x - mean) / std
+    def _instance_norm(self, x: Tensor, lengths: Tensor | None = None) -> Tensor:
+        if lengths is None:
+            mean = x.mean(dim=1, keepdim=True)
+            std = x.std(dim=1, keepdim=True).clamp_min(1e-5)
+            return (x - mean) / std
+        else:
+            batch, steps, channels = x.shape
+            steps_range = torch.arange(steps, device=x.device).unsqueeze(0)
+            mask = (steps_range < lengths.unsqueeze(1)).unsqueeze(-1)
+            
+            x_masked = x * mask
+            sum_x = x_masked.sum(dim=1, keepdim=True)
+            lengths_expanded = lengths.view(-1, 1, 1).clamp_min(1)
+            mean = sum_x / lengths_expanded
+            
+            sq_diff = ((x_masked - mean) * mask).pow(2).sum(dim=1, keepdim=True)
+            divisor = (lengths_expanded - 1).clamp_min(1)
+            variance = sq_diff / divisor
+            std = variance.clamp_min(1e-5).sqrt()
+            
+            return ((x - mean) / std) * mask
 
-    def _encode_tokens(self, x: Tensor, causal: bool) -> Tensor:
-        tokens = self.patch(self._instance_norm(x))
+    def _encode_tokens(self, x: Tensor, causal: bool, lengths: Tensor | None = None) -> Tensor:
+        tokens = self.patch(self._instance_norm(x, lengths))
         if tokens.shape[1] > self.positional.shape[1]:
             raise ValueError("increase positional embedding length for this context")
         tokens = tokens + self.positional[:, : tokens.shape[1]]
         mask = None
+        key_padding_mask = None
+        
+        if lengths is not None:
+            batch, num_patches, _ = tokens.shape
+            patch_indices = torch.arange(num_patches, device=tokens.device).unsqueeze(0)
+            key_padding_mask = (patch_indices * self.patch.patch_size) >= lengths.unsqueeze(1)
+            
         if causal:
             length = tokens.shape[1]
             mask = torch.full((length, length), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=1)
-        return self.transformer(tokens, mask=mask)
+            
+        return self.transformer(tokens, mask=mask, src_key_padding_mask=key_padding_mask)
 
     def encode_context(self, x: Tensor) -> Tensor:
         tokens = self._encode_tokens(x, causal=True)
         return self.norm(tokens[:, -1])
 
-    def encode_interval(self, x: Tensor) -> Tensor:
-        tokens = self._encode_tokens(x, causal=False)
+    def encode_interval(self, x: Tensor, lengths: Tensor) -> Tensor:
+        tokens = self._encode_tokens(x, causal=False, lengths=lengths)
         scores = tokens @ self.pool_query
+        
+        batch, num_patches, _ = tokens.shape
+        patch_indices = torch.arange(num_patches, device=tokens.device).unsqueeze(0)
+        padding_mask = (patch_indices * self.patch.patch_size) >= lengths.unsqueeze(1)
+        
+        scores = scores.masked_fill(padding_mask, float("-inf"))
         weights = scores.softmax(dim=1).unsqueeze(-1)
+        
+        tokens = tokens.masked_fill(padding_mask.unsqueeze(-1), 0.0)
         return self.norm((tokens * weights).sum(dim=1))
 
 
@@ -199,7 +232,7 @@ class HEPA(nn.Module):
     def pretrain_loss(self, context: Tensor, future: Tensor, horizon: Tensor, sigreg_weight: float) -> Tensor:
         past = self.encoder.encode_context(context)
         pred = self.predictor(past, horizon)
-        target = self.encoder.encode_interval(future)
+        target = self.encoder.encode_interval(future, horizon)
         pred_norm = F.normalize(pred, dim=-1)
         target_norm = F.normalize(target, dim=-1)
         prediction_loss = F.l1_loss(pred_norm, target_norm)
@@ -225,6 +258,7 @@ def sigreg(z: Tensor) -> Tensor:
 
 
 def weighted_bce(pred: Tensor, target: Tensor) -> Tensor:
+    pred = pred.clamp(1e-7, 1 - 1e-7)
     positives = target.sum().clamp_min(1.0)
     negatives = (target.numel() - target.sum()).clamp_min(1.0)
     pos_weight = (negatives / positives).detach()
