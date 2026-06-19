@@ -1,4 +1,4 @@
-from hepa.train import main
+from hepa.train_hepa import main
 
 
 if __name__ == "__main__":
